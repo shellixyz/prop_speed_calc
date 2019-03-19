@@ -1,0 +1,125 @@
+#!/usr/bin/env ruby
+
+require 'optparse'
+require 'ostruct'
+require 'tty-table'
+
+M_PER_INCH = 0.0254
+FEET_PER_METER = 3.281
+MILES_PER_KM = 0.6214
+
+DEFAULT_OPTIONS = {
+    cell_voltage: 4,
+    units: :metric,
+    final_speed_ratio: 0.75,
+    array_unit: 'km/h',
+    prop_pitch: [ 3, 4, 4.2, 4.3, 4.5, 4.9, 5, 5.1, 5.5, 6, 7, 7.5, 8 ]
+}
+
+VALID_ARRAY_UNITS = %w[ m/s km/h ]
+
+options = OpenStruct.new DEFAULT_OPTIONS
+
+def display_usage op
+    puts op
+    exit 1
+end
+
+op = OptionParser.new
+op.banner = "Usage: #$0 --kv=value [options] [pitch(es)]"
+op.on('--kv=integer', Integer) { |value| options.kv = value }
+op.on('--voltage=float', Float) { |value| options.voltage = value }
+op.on('--cells=integer', Integer) { |value| options.cells = value }
+op.on('--rpm=integer', Integer) { |value| options.rpm = value }
+op.on('--cell-voltage=float', Float) { |value| options.cell_voltage = value }
+op.on('--final-speed-ratio=float', Float) { |value| options.final_speed_ratio = value }
+op.on('--imperial') { options.units = :imperial }
+
+op.on('--array-unit=value', 'Unit to use for displaying speeds in arrays. Valid values are m/s and km/h') do |value|
+    raise OptionParser::InvalidArgument unless VALID_ARRAY_UNITS.index(value)
+    options.array_unit = value
+end
+
+op.on('--prop-pitch=value', Array) do |values|
+    if values.empty?
+        STDERR.puts "Invalid argument: --prop-pitch expects a list of propeller pitches separated by commas"
+        display_usage op
+    end
+
+    options.prop_pitch =
+        values.map do |value|
+            begin
+                Float(value)
+            rescue ArgumentError
+                STDERR.puts "Invalid argument: --prop-pitch: invalid prop pitch value: #{value}"
+                display_usage op
+            end
+        end
+end
+
+display_usage(op) if ARGV.empty?
+
+begin
+op.parse!
+rescue OptionParser::InvalidArgument => error
+    STDERR.puts error.message.capitalize
+    display_usage op
+end
+
+display_usage(op) if ARGV.count > 1
+
+options.prop_pitch = ARGV.first.split(',').map { |value| value.to_f } unless ARGV.empty?
+
+def theoretical_max_speed prop_pitch, final_speed_ratio, options = {}
+    raise ArgumentError, 'needs rpm, or voltage and kv' unless options.has_key?(:rpm) or (options.has_key?(:voltage) and options.has_key?(:kv))
+    rpm = options.has_key?(:rpm) ? options[:rpm] : options[:voltage] * options[:kv]
+    distance_per_turn = prop_pitch * M_PER_INCH
+    speed_meter_per_second = distance_per_turn * rpm * final_speed_ratio / 60
+    speed_km_per_hour = speed_meter_per_second * 3600 / 1000
+    [ speed_meter_per_second, speed_km_per_hour ]
+end
+
+def display_speed prop_pitch, rpm, final_speed_ratio, units: :metric, array_unit: 'km/h'
+    prop_pitch = prop_pitch.first if prop_pitch.count == 1
+    if prop_pitch.is_a? Array
+        array_unit_index = VALID_ARRAY_UNITS.index array_unit
+        pitch_speeds = prop_pitch.map { |pitch| theoretical_max_speed(pitch, final_speed_ratio, rpm: rpm)[array_unit_index].round }
+        puts TTY::Table.new([{value: 'Pitch', alignment: :left}, *prop_pitch], [["Speed (#{array_unit})", *pitch_speeds]]).render(:unicode) { |renderer| renderer.alignments = [:right] * (prop_pitch.count + 1) }
+    else
+        m_per_sec, km_per_hour = theoretical_max_speed prop_pitch, final_speed_ratio, rpm: rpm
+
+        case units
+        when :metric
+            printf "%.1f m/s, %d km/h\n", m_per_sec, km_per_hour.round
+        when :imperial
+            printf "%.1f ft/s, %d mph\n", m_per_sec * FEET_PER_METER, (km_per_hour * MILES_PER_KM).round
+        else
+            raise ArgumentError, "invalid units type: #{units}"
+        end
+    end
+end
+
+if options.rpm
+
+    display_speed options.prop_pitch, options.rpm, options.final_speed_ratio, units: options.units, array_unit: options.array_unit
+
+else
+
+    raise ArgumentError, "rpm or kv needed" unless options.kv
+
+    if options.voltage or options.cells
+        raise ArgumentError, "cells and voltage can't be both specified" if options.voltage and options.cells
+        voltage = options.cells ? options.cells * options.cell_voltage : options.voltage
+        rpm = voltage * options.kv
+        display_speed options.prop_pitch, rpm, options.final_speed_ratio, units: options.units
+    else
+        array_unit_index = VALID_ARRAY_UNITS.index options[:array_unit]
+        pitch_speeds =
+            (1..6).map do |cells|
+                rpm = cells * options.cell_voltage * options.kv
+                [ "#{cells}S", *options.prop_pitch.map { |pitch| theoretical_max_speed(pitch, options.final_speed_ratio, rpm: rpm)[array_unit_index].round } ]
+            end
+        puts TTY::Table.new(['', *options.prop_pitch], pitch_speeds).render(:unicode) { |renderer| renderer.alignments = [:right] * (options.prop_pitch.count + 1) }
+    end
+
+end
